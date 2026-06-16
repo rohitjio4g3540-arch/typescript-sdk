@@ -8,6 +8,7 @@ import {
 } from '@modelcontextprotocol/core';
 import type { Transport } from '@modelcontextprotocol/server';
 import {
+    isInputRequiredResult,
     isJSONRPCErrorResponse,
     isJSONRPCNotification,
     isJSONRPCRequest,
@@ -87,6 +88,10 @@ export function assertWireMessage(msg: unknown, party: WireParty, opts: SnifferO
 
     if (isJSONRPCResultResponse(msg)) {
         const result = (msg as { result: unknown }).result;
+        // Multi-round-trip results (protocol revision 2026-07-28) are valid
+        // server output but deliberately NOT part of the neutral result union
+        // (InputRequiredResultSchema lives alongside, never widening it).
+        if (party === 'server' && isInputRequiredResult(result)) return;
         const r = schemas.result.safeParse(result);
         if (!r.success) {
             // A result for a vendor-extension request legitimately won't match the spec union.
