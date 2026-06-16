@@ -80,6 +80,22 @@ import * as z from 'zod/v4';
  */
 const INPUT_REQUIRED_CAPABLE_METHODS: ReadonlySet<string> = new Set(['tools/call', 'prompts/get', 'resources/read']);
 
+/**
+ * Symbol-keyed carrier for the per-request classification on the handler
+ * context: set at `buildContext` time and read by the multi-round-trip seam in
+ * `_wrapHandler` to decide which era a handler's `input_required` return is
+ * being served on (a long-lived dual-era instance is never bound to a single
+ * era). Symbol-keyed properties never appear in JSON serialization and the key
+ * is not exported, so nothing about it is part of the public context surface
+ * (the same pattern used for the result cache-hint carrier).
+ */
+const CONTEXT_CLASSIFICATION: unique symbol = Symbol('modelcontextprotocol.serverContextClassification');
+
+/** A handler context that may carry the per-request classification. */
+interface ContextClassificationCarrier {
+    [CONTEXT_CLASSIFICATION]?: MessageClassification;
+}
+
 export type ServerOptions = ProtocolOptions & {
     /**
      * Capabilities to advertise as being supported by this server.
@@ -288,14 +304,6 @@ export class Server extends Protocol<ServerContext> {
     private _instructions?: string;
     private _jsonSchemaValidator: jsonSchemaValidator;
     private _eraSupport: 'legacy' | 'dual-era' | 'modern';
-    /**
-     * Per-request classification of the request a handler context was built
-     * for, keyed by the context object handed to the handler. The
-     * multi-round-trip seam in `_wrapHandler` reads it to decide which era a
-     * handler's `input_required` return is being served on (a long-lived
-     * dual-era instance is never bound to a single era).
-     */
-    private _contextClassifications = new WeakMap<object, MessageClassification>();
     /**
      * The protocol version a legacy `initialize` handshake negotiated on a
      * dual-era instance. A dual-era instance is never bound to a single era
@@ -514,9 +522,11 @@ export class Server extends Protocol<ServerContext> {
                 : undefined
         };
         if (classification !== undefined) {
-            // Remembered for the multi-round-trip seam (input_required returns
-            // are only legal toward the era that defines them).
-            this._contextClassifications.set(built, classification);
+            // Carried on the context itself (symbol-keyed, never serialized,
+            // not part of the public context types) for the multi-round-trip
+            // seam: input_required returns are only legal toward the era that
+            // defines them.
+            (built as ContextClassificationCarrier)[CONTEXT_CLASSIFICATION] = classification;
         }
         return built;
     }
@@ -645,11 +655,12 @@ export class Server extends Protocol<ServerContext> {
 
     /**
      * The protocol revision a handler context's request is being served on:
-     * the per-request classification when the entry/transport supplied one,
-     * the instance's negotiated version otherwise.
+     * the per-request classification carried on the context (when the
+     * entry/transport supplied one), the instance's negotiated version
+     * otherwise.
      */
     private _servedProtocolVersionFor(ctx: ServerContext): string | undefined {
-        const classification = this._contextClassifications.get(ctx);
+        const classification = (ctx as ContextClassificationCarrier)[CONTEXT_CLASSIFICATION];
         if (classification !== undefined) {
             return classification.revision ?? (classification.era === 'modern' ? FIRST_MODERN_PROTOCOL_VERSION : undefined);
         }
