@@ -31,6 +31,7 @@ import { SdkError, SdkErrorCode } from '../../errors/sdkErrors.js';
 import type { Result } from '../../types/types.js';
 import type { DecodedResult, LiftedWireMaterial, WireCodec } from '../codec.js';
 import { fillCacheFields, stampResultType } from './encodeContract.js';
+import { getInputRequestSchema2026, getInputResponseSchema2026 } from './inputRequired.js';
 import {
     getNotificationSchema2026,
     getRequestSchema2026,
@@ -98,6 +99,12 @@ export const rev2026Codec: WireCodec = {
     requestSchema: getRequestSchema2026,
     resultSchema: getResultSchema2026,
     notificationSchema: getNotificationSchema2026,
+
+    // In-band multi-round-trip vocabulary: the demoted elicitation/sampling/
+    // roots shapes carried inside `input_required` results (NOT wire request
+    // methods on this era — registry membership is deliberately not granted).
+    inputRequestSchema: getInputRequestSchema2026,
+    inputResponseSchema: getInputResponseSchema2026,
 
     decodeResult(method: string, raw: unknown): DecodedResult {
         if (!isPlainObject(raw)) {

@@ -64,9 +64,6 @@ const ERROR_OBJECT_DIRS = new Set([
  * fails loudly. These burn down as the corresponding features land.
  */
 const PENDING_2026: Record<string, string> = {
-    InputRequests: 'multi-round-trip request vocabulary (SEP-2322) is not modeled yet',
-    InputRequiredResult: 'multi-round-trip request vocabulary (SEP-2322) is not modeled yet',
-    InputResponses: 'multi-round-trip request vocabulary (SEP-2322) is not modeled yet',
     SubscriptionsAcknowledgedNotification: 'subscriptions/listen vocabulary (SEP-1865) is not modeled yet',
     SubscriptionsListenRequest: 'subscriptions/listen vocabulary (SEP-1865) is not modeled yet'
 };
