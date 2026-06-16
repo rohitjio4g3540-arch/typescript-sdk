@@ -9,6 +9,8 @@ import type {
     ElicitRequestFormParams,
     ElicitRequestURLParams,
     ElicitResult,
+    HandlerResultTypeMap,
+    InputRequiredResult,
     JSONRPCErrorResponse,
     JSONRPCNotification,
     JSONRPCRequest,
@@ -50,6 +52,8 @@ import { isStandardSchema, validateStandardSchema } from '../util/standardSchema
 import { bootstrapOutboundCodec } from '../wire/bootstrap.js';
 import type { LiftedWireMaterial, WireCodec } from '../wire/codec.js';
 import { classifiedWireEra, codecForVersion, isSpecNotificationMethod, isSpecRequestMethod } from '../wire/codec.js';
+import type { InputRequiredPayload, ResolvedInputRequiredDriverConfig } from './inputRequiredDriver.js';
+import { runInputRequiredDriver } from './inputRequiredDriver.js';
 import type { Transport, TransportSendOptions } from './transport.js';
 
 /**
@@ -125,8 +129,27 @@ export type RequestOptions = {
      * Maximum total time (in milliseconds) to wait for a response.
      * If exceeded, an {@linkcode SdkError} with code {@linkcode SdkErrorCode.RequestTimeout} will be raised, regardless of progress notifications.
      * If not specified, there is no maximum total timeout.
+     *
+     * For multi-round-trip requests fulfilled by the auto-fulfilment driver
+     * (protocol revision 2026-07-28), the budget bounds the WHOLE flow: every
+     * retry leg is given only the time remaining.
      */
     maxTotalTimeout?: number;
+
+    /**
+     * Manual multi-round-trip mode for this call (protocol revision
+     * 2026-07-28): when the response is an `input_required` result, hand it
+     * back to the caller instead of auto-fulfilling it (or raising a typed
+     * error). The resolved value is the neutral input-required shape
+     * (`resultType: 'input_required'`, `inputRequests?`, `requestState?`);
+     * wrap the result schema with `withInputRequired()` on the explicit
+     * schema path to type both outcomes. The caller is then responsible for
+     * gathering the requested input and retrying the original request with
+     * `inputResponses` / `requestState` params and a fresh request.
+     *
+     * Default: `false`.
+     */
+    allowInputRequired?: boolean;
 } & TransportSendOptions;
 
 /**
@@ -213,6 +236,45 @@ function liftWireOnlyMaterial<T extends JSONRPCRequest | JSONRPCNotification>(
 }
 
 /**
+ * Splits a retried request's `inputResponses` map into the BARE response
+ * entries the spec defines and everything else. The spec's embedded responses
+ * are the bare result objects (an `ElicitResult`, `CreateMessageResult`, or
+ * `ListRootsResult`); a wrapped `{method, result}` envelope (a shape some
+ * peers emit) is never accepted as a response — its key is recorded so the
+ * handler can re-issue the corresponding input request.
+ */
+/**
+ * Related send/notify are unavailable inside an embedded input-request
+ * handler: the request is fulfilled locally by the multi-round-trip driver,
+ * so there is no live peer request to relate messages to.
+ */
+function relatedMessagingUnavailable(member: string): never {
+    throw new SdkError(
+        SdkErrorCode.SendFailed,
+        `ctx.mcpReq.${member} is not available while fulfilling an embedded input request: ` +
+            `the request is fulfilled locally and has no related peer request`
+    );
+}
+
+function partitionInputResponses(inputResponses: unknown): { accepted: Record<string, unknown>; droppedKeys: string[] } {
+    const accepted: Record<string, unknown> = {};
+    const droppedKeys: string[] = [];
+    if (!isPlainObject(inputResponses)) {
+        return { accepted, droppedKeys };
+    }
+    for (const [key, entry] of Object.entries(inputResponses)) {
+        // Bare responses never carry `method` or `result` members — both are
+        // the signature of the wrapped (JSON-RPC-shaped) form.
+        if (!isPlainObject(entry) || 'method' in entry || 'result' in entry) {
+            droppedKeys.push(key);
+            continue;
+        }
+        accepted[key] = entry;
+    }
+    return { accepted, droppedKeys };
+}
+
+/**
  * Base context provided to all request handlers.
  */
 export type BaseContext = {
@@ -256,14 +318,37 @@ export type BaseContext = {
         /**
          * Multi-round-trip input responses carried by a retried request
          * (protocol revision 2026-07-28), lifted out of the params the
-         * handler sees. Driver material — present verbatim when sent.
+         * handler sees. Entries are the BARE response objects keyed by the
+         * identifiers the server assigned in `inputRequests`; entries that do
+         * not look like bare responses (e.g. a `{method, result}` wrapper)
+         * are dropped and their keys recorded in
+         * {@linkcode BaseContext.mcpReq.droppedInputResponseKeys | droppedInputResponseKeys}.
+         *
+         * The values arrive from the client and are NOT validated by the SDK
+         * — treat them as untrusted input.
          */
         inputResponses?: Record<string, unknown>;
+
+        /**
+         * Keys of `inputResponses` entries the SDK dropped because they were
+         * not bare response objects (for example the wrapped `{method,
+         * result}` shape some peers emit). Surfaced so a handler can re-issue
+         * the corresponding input request rather than hard-fail.
+         */
+        droppedInputResponseKeys?: string[];
 
         /**
          * Multi-round-trip request state echoed by a retried request
          * (protocol revision 2026-07-28), lifted out of the params the
          * handler sees. Driver material — present verbatim when sent.
+         *
+         * SECURITY: `requestState` round-trips through the client and MUST be
+         * treated as attacker-controlled input. The SDK applies no integrity
+         * protection: if this value influences authorization, resource
+         * access, or business logic, the server MUST integrity-protect it
+         * (e.g. HMAC or AEAD) when minting it and MUST verify it here,
+         * rejecting state that fails verification (spec:
+         * basic/patterns/mrtr, server requirements 4–5).
          */
         requestState?: string;
 
@@ -432,6 +517,17 @@ export abstract class Protocol<ContextT extends BaseContext> {
      * (`Client.connect`, `Server._oninitialize`).
      */
     protected _negotiatedProtocolVersion?: string;
+
+    /**
+     * Multi-round-trip auto-fulfilment configuration (protocol revision
+     * 2026-07-28). `undefined` (the base default) means this instance has no
+     * driver: an `input_required` response surfaces as a typed local error
+     * unless the call opted into manual mode. The `Client` populates this
+     * from `ClientOptions.inputRequired` (auto-fulfilment on by default);
+     * `Server` instances never receive `input_required` responses on their
+     * outbound legs and leave it unset.
+     */
+    protected _inputRequiredDriverConfig?: ResolvedInputRequiredDriverConfig;
 
     static {
         writeNegotiatedProtocolVersion = (instance, version) => {
@@ -840,6 +936,13 @@ export abstract class Protocol<ContextT extends BaseContext> {
         const abortController = new AbortController();
         this._requestHandlerAbortControllers.set(request.id, abortController);
 
+        // Multi-round-trip retry material: only BARE response objects are
+        // surfaced to the handler; entries that look like a wrapped
+        // `{method, result}` shape (or are not objects at all) are dropped
+        // and their keys recorded so the handler can re-issue the input
+        // request instead of hard-failing (D-059 posture).
+        const partitionedInputResponses = lifted.inputResponses === undefined ? undefined : partitionInputResponses(lifted.inputResponses);
+
         const baseCtx: BaseContext = {
             sessionId: capturedTransport?.sessionId,
             mcpReq: {
@@ -847,7 +950,11 @@ export abstract class Protocol<ContextT extends BaseContext> {
                 method: request.method,
                 _meta: request.params?._meta,
                 ...(lifted.envelope !== undefined && { envelope: lifted.envelope }),
-                ...(lifted.inputResponses !== undefined && { inputResponses: lifted.inputResponses }),
+                ...(partitionedInputResponses !== undefined && { inputResponses: partitionedInputResponses.accepted }),
+                ...(partitionedInputResponses !== undefined &&
+                    partitionedInputResponses.droppedKeys.length > 0 && {
+                        droppedInputResponseKeys: partitionedInputResponses.droppedKeys
+                    }),
                 ...(lifted.requestState !== undefined && { requestState: lifted.requestState }),
                 signal: abortController.signal,
                 // BaseContext.mcpReq.send is declared with two overloads (spec-method-keyed and explicit-schema). Arrow
@@ -1232,14 +1339,43 @@ export abstract class Protocol<ContextT extends BaseContext> {
                     return reject(decoded.error);
                 }
                 if (decoded.kind === 'input_required') {
-                    // Driver seam: the multi-round-trip driver (M4.1)
-                    // consumes this payload; until it lands, surface the
-                    // discriminated kind as a typed local error, no retry.
-                    return reject(
-                        new SdkError(SdkErrorCode.UnsupportedResultType, `Unsupported result type 'input_required' for ${request.method}`, {
+                    const payload: InputRequiredPayload = {
+                        inputRequests: decoded.inputRequests,
+                        ...(decoded.requestState !== undefined && { requestState: decoded.requestState })
+                    };
+                    // Manual mode (the primitive the driver itself is layered
+                    // over): hand the input-required value back to the caller.
+                    if (options?.allowInputRequired === true) {
+                        const manualValue: InputRequiredResult = {
                             resultType: 'input_required',
-                            method: request.method
-                        })
+                            inputRequests: payload.inputRequests as InputRequiredResult['inputRequests'],
+                            ...(payload.requestState !== undefined && { requestState: payload.requestState })
+                        };
+                        return resolve(manualValue as StandardSchemaV1.InferOutput<T>);
+                    }
+                    // Auto-fulfilment driver: dispatch the embedded requests
+                    // to the registered handlers and retry with fresh ids.
+                    const driverConfig = this._inputRequiredDriverConfig;
+                    if (driverConfig !== undefined && driverConfig.autoFulfill) {
+                        return resolve(
+                            this._runInputRequiredDriver(codec, request, resultSchema, options, payload) as Promise<
+                                StandardSchemaV1.InferOutput<T>
+                            >
+                        );
+                    }
+                    // No driver (or auto-fulfilment disabled) and no manual
+                    // opt-in: typed local error, no retry.
+                    return reject(
+                        new SdkError(
+                            SdkErrorCode.UnsupportedResultType,
+                            `Unsupported result type 'input_required' for ${request.method}: ` +
+                                `multi-round-trip auto-fulfilment is not enabled on this instance — ` +
+                                `pass allowInputRequired: true to handle it manually, or enable inputRequired.autoFulfill`,
+                            {
+                                resultType: 'input_required',
+                                method: request.method
+                            }
+                        )
                     );
                 }
                 const result = decoded.result;
@@ -1278,6 +1414,111 @@ export abstract class Protocol<ContextT extends BaseContext> {
                 this._cleanupTimeout(cleanupMessageId);
             }
         });
+    }
+
+    /**
+     * Runs the multi-round-trip auto-fulfilment driver for one originating
+     * request whose response came back as `input_required`. The driver is a
+     * layer over the manual path: every retry re-enters the request funnel
+     * with `allowInputRequired: true`, so a fresh request id is assigned per
+     * leg, the per-leg timeout applies unchanged, and a further
+     * `input_required` answer is handed back to the loop instead of recursing
+     * into another driver run (the round cap is global to the flow).
+     */
+    private _runInputRequiredDriver<T extends StandardSchemaV1>(
+        codec: WireCodec,
+        request: Request,
+        resultSchema: T,
+        options: RequestOptions | undefined,
+        firstPayload: InputRequiredPayload
+    ): Promise<unknown> {
+        const config = this._inputRequiredDriverConfig;
+        if (config === undefined) {
+            return Promise.reject(new Error('Input-required driver invoked without configuration'));
+        }
+        return runInputRequiredDriver({
+            config,
+            method: request.method,
+            originalParams: request.params,
+            firstPayload,
+            requestOptions: {
+                ...(options?.timeout !== undefined && { timeout: options.timeout }),
+                ...(options?.maxTotalTimeout !== undefined && { maxTotalTimeout: options.maxTotalTimeout }),
+                ...(options?.onprogress !== undefined && { onprogress: options.onprogress })
+            },
+            hooks: {
+                dispatchInputRequest: (key, entry) => this._dispatchInputRequest(codec, key, entry, options),
+                retry: (params, legOptions) => {
+                    const retryRequest: Request = params === undefined ? { method: request.method } : { method: request.method, params };
+                    return this._requestWithSchemaViaCodec(codec, retryRequest, resultSchema, {
+                        ...options,
+                        ...legOptions,
+                        allowInputRequired: true
+                    });
+                }
+            }
+        });
+    }
+
+    /**
+     * Dispatches one embedded (de-JSON-RPC'd) input request to the locally
+     * registered handler for its method and resolves with the bare response.
+     *
+     * The handler runs through the same stored handler chain as a wire
+     * request (including role-specific validation installed by
+     * `_wrapHandler`), with a synthesized context: the id is the
+     * inputRequests key (correlation only — it is not a JSON-RPC message id),
+     * the originating call's abort signal chains through, and related
+     * `send`/`notify` are unavailable because there is no live peer request
+     * to relate them to.
+     */
+    private async _dispatchInputRequest(codec: WireCodec, key: string, entry: unknown, options?: RequestOptions): Promise<unknown> {
+        if (!isPlainObject(entry) || typeof entry['method'] !== 'string') {
+            throw new SdkError(
+                SdkErrorCode.InvalidResult,
+                `Invalid input request '${key}': each inputRequests entry must be an embedded request object with a method`,
+                { key }
+            );
+        }
+        const method = entry['method'];
+        if (codec.inputRequestSchema(method) === undefined) {
+            throw new SdkError(
+                SdkErrorCode.InvalidResult,
+                `Invalid input request '${key}': '${method}' is not an embedded request the ${codec.era} revision defines ` +
+                    `(expected elicitation/create, sampling/createMessage, or roots/list)`,
+                { key, method }
+            );
+        }
+        const handler = this._requestHandlers.get(method);
+        if (handler === undefined) {
+            throw new SdkError(
+                SdkErrorCode.CapabilityNotSupported,
+                `Cannot fulfil input request '${key}': no handler is registered for '${method}' on this client. ` +
+                    `Declare the corresponding capability and register a handler, or handle input_required results manually.`,
+                { key, method }
+            );
+        }
+
+        const params = isPlainObject(entry['params']) ? (entry['params'] as Record<string, unknown>) : undefined;
+        const synthesizedRequest: JSONRPCRequest = {
+            jsonrpc: '2.0',
+            id: key,
+            method,
+            ...(params !== undefined && { params })
+        };
+        const baseCtx: BaseContext = {
+            sessionId: this._transport?.sessionId,
+            mcpReq: {
+                id: key,
+                method,
+                _meta: params?.['_meta'] as RequestMeta | undefined,
+                signal: options?.signal ?? new AbortController().signal,
+                send: (() => relatedMessagingUnavailable('send')) as BaseContext['mcpReq']['send'],
+                notify: () => relatedMessagingUnavailable('notify')
+            }
+        };
+        const ctx = this.buildContext(baseCtx, undefined);
+        return await handler(synthesizedRequest, ctx);
     }
 
     /**
@@ -1371,7 +1612,7 @@ export abstract class Protocol<ContextT extends BaseContext> {
      */
     setRequestHandler<M extends RequestMethod>(
         method: M,
-        handler: (request: RequestTypeMap[M], ctx: ContextT) => ResultTypeMap[M] | Promise<ResultTypeMap[M]>
+        handler: (request: RequestTypeMap[M], ctx: ContextT) => HandlerResultTypeMap[M] | Promise<HandlerResultTypeMap[M]>
     ): void;
     setRequestHandler<P extends StandardSchemaV1, R extends StandardSchemaV1 | undefined = undefined>(
         method: string,
@@ -1396,9 +1637,14 @@ export abstract class Protocol<ContextT extends BaseContext> {
             // Dispatch-time schema resolution: the request is parsed with the
             // schema of the era serving this connection (the instance era at
             // dispatch time), never with a schema captured at registration
-            // time.
+            // time. On the 2026-07-28 era the demoted server→client methods
+            // (elicitation/sampling/roots) are not wire request methods —
+            // they reach a handler only as embedded input requests dispatched
+            // by the multi-round-trip driver, and parse with the era's
+            // in-band schema instead.
             stored = (request, ctx) => {
-                const schema = this._negotiatedWireCodec().requestSchema(method);
+                const dispatchCodec = this._negotiatedWireCodec();
+                const schema = dispatchCodec.requestSchema(method) ?? dispatchCodec.inputRequestSchema(method);
                 if (!schema) {
                     // Unreachable: the dispatch era gate rejects era-mismatched
                     // spec methods with −32601 before any handler runs.
