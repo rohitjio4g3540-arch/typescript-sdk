@@ -1149,9 +1149,11 @@ server.registerTool('deploy', { inputSchema: z.object({ env: z.string() }) }, as
 ```
 
 On 2026-era requests the push-style APIs (`ctx.mcpReq.send` of server→client requests, `ctx.mcpReq.elicitInput`, `ctx.mcpReq.requestSampling`, and the instance-level `server.createMessage()`/`elicitInput()`/`listRoots()`/`ping()` on modern-bound instances) fail with a
-typed local error before anything reaches the wire; in a tool handler the error surfaces to the caller as an `isError` result whose text steers to returning `inputRequired(...)`. Their behavior toward 2025-era requests is unchanged. The `-32042` URL-elicitation error also
-never appears on the 2026-07-28 wire: a `UrlElicitationRequiredError` thrown while serving a 2026-era request is converted into a URL-mode elicitation embedded in an `input_required` result (when the request declared the `elicitation.url` capability), while 2025-era serving
-keeps today's `-32042` behavior exactly.
+typed local error before anything reaches the wire; in a tool handler the error surfaces to the caller as an `isError` result whose text steers to returning `inputRequired(...)`. Their behavior toward 2025-era requests is unchanged. The error surface differs per family
+exactly as it always has: only `tools/call` has a catch-all that wraps handler failures into `isError` results — errors thrown by `prompts/get` and `resources/read` handlers (including the loud failures of the seam guards) surface as JSON-RPC errors. The `-32042`
+URL-elicitation error also never appears on the 2026-07-28 wire: a `UrlElicitationRequiredError` thrown while serving a 2026-era request is converted into a URL-mode elicitation embedded in an `input_required` result (when the request declared the `elicitation.url`
+capability), while 2025-era serving keeps today's `-32042` behavior exactly. Note that the `notifications/elicitation/complete` notification has no delivery channel under modern per-request HTTP serving (there is no server→client stream tied to a completed request), so do
+not rely on it to resume URL elicitations on the 2026-07-28 era — carry the resumption through `requestState` and the retry instead.
 
 **`requestState` is untrusted input — protect it yourself.** `inputRequired({ requestState })` lets a server round-trip opaque state through the client instead of holding it in memory. The SDK treats it as an opaque string end to end: the client echoes it back byte-exact
 and never parses it, and the server sees the echoed value raw at `ctx.mcpReq.requestState`. The specification's requirement is the consumer's obligation: the value comes back as **attacker-controlled input**, so if it influences authorization, resource access, or business
