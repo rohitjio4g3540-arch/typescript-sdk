@@ -781,6 +781,15 @@ export class Server extends Protocol<ServerContext> {
      * never reaches the 2026-07-28 wire.
      */
     private _convertUrlElicitationRequiredError(error: UrlElicitationRequiredError, ctx: ServerContext): Result {
+        if (error.elicitations.length === 0) {
+            // Nothing to embed: converting would produce an input_required
+            // with an empty inputRequests map (violating the at-least-one
+            // rule), so this is a server bug surfaced loudly instead.
+            throw new ProtocolError(
+                ProtocolErrorCode.InternalError,
+                'URL elicitation was signalled for this request, but the error carries no elicitations to embed'
+            );
+        }
         const declared = ctx.mcpReq.envelope?.[CLIENT_CAPABILITIES_META_KEY] as ClientCapabilities | undefined;
         if (declared?.elicitation?.url === undefined) {
             throw new ProtocolError(

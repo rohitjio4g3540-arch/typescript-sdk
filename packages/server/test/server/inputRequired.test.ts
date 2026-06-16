@@ -235,10 +235,11 @@ describe('guards', () => {
         );
         const { request, close } = await wire(server);
 
-        // No elicitation capability declared on the request → -32003 naming it.
+        // No elicitation capability declared on the request → -32003 naming
+        // the form sub-capability the embedded form-mode elicitation needs.
         const noCapability = await request(modernToolCall(1, 'ask', {}, { clientCapabilities: {} }));
         expect(errorOf(noCapability).code).toBe(-32_003);
-        expect(errorOf(noCapability).data).toMatchObject({ requiredCapabilities: { elicitation: {} } });
+        expect(errorOf(noCapability).data).toMatchObject({ requiredCapabilities: { elicitation: { form: {} } } });
 
         // Form-mode capability declared → the same tool is served.
         const withCapability = await request(modernToolCall(2, 'ask', {}, { clientCapabilities: { elicitation: { form: {} } } }));
@@ -250,6 +251,17 @@ describe('guards', () => {
         );
         expect(errorOf(urlWithoutUrlCapability).code).toBe(-32_003);
         expect(errorOf(urlWithoutUrlCapability).data).toMatchObject({ requiredCapabilities: { elicitation: { url: {} } } });
+
+        // Form-mode embedded request toward a URL-only client → -32003: modes
+        // are sub-capabilities and the server must not send an undeclared one.
+        const formTowardUrlOnly = await request(modernToolCall(4, 'ask', {}, { clientCapabilities: { elicitation: { url: {} } } }));
+        expect(errorOf(formTowardUrlOnly).code).toBe(-32_003);
+        expect(errorOf(formTowardUrlOnly).data).toMatchObject({ requiredCapabilities: { elicitation: { form: {} } } });
+
+        // A bare `elicitation: {}` declaration is read as form support (the
+        // pre-mode meaning of a bare declaration) → served.
+        const bareElicitation = await request(modernToolCall(5, 'ask', {}, { clientCapabilities: { elicitation: {} } }));
+        expect(resultOf(bareElicitation).resultType).toBe('input_required');
 
         await close();
     });
@@ -322,6 +334,21 @@ describe('F5 conversion guard (UrlElicitationRequiredError)', () => {
 
         const answer = await request(modernToolCall(1, 'protected', {}, { clientCapabilities: {} }));
         expect(errorOf(answer).code).toBe(-32_603);
+        expect(JSON.stringify(answer)).not.toContain('32042');
+
+        await close();
+    });
+
+    it('fails loudly when the error carries no elicitations (never an empty inputRequests map)', async () => {
+        const server = new McpServer({ name: 's', version: '1.0.0' }, { capabilities: { tools: {} }, eraSupport: 'dual-era' });
+        server.registerTool('protected', { inputSchema: z.object({}) }, async () => {
+            throw new UrlElicitationRequiredError([]);
+        });
+        const { request, close } = await wire(server);
+
+        const answer = await request(modernToolCall(1, 'protected', {}, { clientCapabilities: { elicitation: { url: {} } } }));
+        expect(errorOf(answer).code).toBe(-32_603);
+        expect(JSON.stringify(answer)).not.toContain('"resultType":"input_required"');
         expect(JSON.stringify(answer)).not.toContain('32042');
 
         await close();
