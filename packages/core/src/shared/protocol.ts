@@ -1232,6 +1232,10 @@ export abstract class Protocol<ContextT extends BaseContext> {
         options?: RequestOptions
     ): Promise<StandardSchemaV1.InferOutput<T>> {
         const { relatedRequestId, resumptionToken, onresumptiontoken } = options ?? {};
+        // Flow start for the multi-round-trip driver: `maxTotalTimeout` bounds
+        // the WHOLE flow, so the budget is measured from the original request,
+        // not from when the driver takes over after the first leg.
+        const flowStartedAt = Date.now();
 
         let onAbort: (() => void) | undefined;
         let cleanupMessageId: number | undefined;
@@ -1357,7 +1361,7 @@ export abstract class Protocol<ContextT extends BaseContext> {
                     const driverConfig = this._inputRequiredDriverConfig;
                     if (driverConfig !== undefined && driverConfig.autoFulfill) {
                         return resolve(
-                            this._runInputRequiredDriver(codec, request, resultSchema, options, payload) as Promise<
+                            this._runInputRequiredDriver(codec, request, resultSchema, options, payload, flowStartedAt) as Promise<
                                 StandardSchemaV1.InferOutput<T>
                             >
                         );
@@ -1429,7 +1433,8 @@ export abstract class Protocol<ContextT extends BaseContext> {
         request: Request,
         resultSchema: T,
         options: RequestOptions | undefined,
-        firstPayload: InputRequiredPayload
+        firstPayload: InputRequiredPayload,
+        flowStartedAt: number
     ): Promise<unknown> {
         const config = this._inputRequiredDriverConfig;
         if (config === undefined) {
@@ -1440,6 +1445,7 @@ export abstract class Protocol<ContextT extends BaseContext> {
             method: request.method,
             originalParams: request.params,
             firstPayload,
+            flowStartedAt,
             requestOptions: {
                 ...(options?.timeout !== undefined && { timeout: options.timeout }),
                 ...(options?.maxTotalTimeout !== undefined && { maxTotalTimeout: options.maxTotalTimeout }),

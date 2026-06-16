@@ -7,7 +7,7 @@
  */
 import type { ElicitResult, JSONRPCMessage, JSONRPCRequest } from '@modelcontextprotocol/core';
 import { InMemoryTransport, SdkError, SdkErrorCode } from '@modelcontextprotocol/core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { Client } from '../../src/client/client.js';
 import type { ClientOptions } from '../../src/client/client.js';
@@ -181,6 +181,98 @@ describe('auto-fulfilment (default on)', () => {
             code: SdkErrorCode.CapabilityNotSupported,
             data: { key: 'sample', method: 'sampling/createMessage' }
         });
+
+        await client.close();
+    });
+
+    it('validates a forked, tool-bearing embedded sampling response against the 2026 in-band response schema', async () => {
+        const SAMPLING_WITH_TOOLS_ENTRY = {
+            method: 'sampling/createMessage',
+            params: {
+                messages: [{ role: 'user', content: { type: 'text', text: 'What is the weather in Berlin?' } }],
+                maxTokens: 200,
+                tools: [{ name: 'get_weather', inputSchema: { type: 'object', properties: { city: { type: 'string' } } } }]
+            }
+        };
+        // Forked 2026 vocabulary: array content with a tool_use block and a
+        // tool_result block whose structuredContent is NOT an object (the
+        // 2026 anchor allows any value there; the 2025 result schemas do not).
+        // This pins that the embedded response is validated against the era's
+        // in-band response schema, mirroring the request-side selection.
+        const TOOL_BEARING_RESPONSE = {
+            model: 'test-model-1',
+            role: 'assistant' as const,
+            stopReason: 'toolUse',
+            content: [
+                { type: 'tool_use' as const, name: 'get_weather', id: 'call-1', input: { city: 'Berlin' } },
+                {
+                    type: 'tool_result' as const,
+                    toolUseId: 'call-0',
+                    content: [{ type: 'text' as const, text: '21°C' }],
+                    structuredContent: 21
+                }
+            ]
+        };
+        const { clientTx, toolCalls } = await scriptedModernServer((_request, call) =>
+            call === 1 ? { resultType: 'input_required', inputRequests: { weather: SAMPLING_WITH_TOOLS_ENTRY } } : COMPLETE_RESULT
+        );
+
+        const client = makeClient({ capabilities: { sampling: { tools: {} } } });
+        // The non-object structuredContent is deliberately outside the 2025
+        // result types (it is the 2026 fork) — hence the cast.
+        client.setRequestHandler('sampling/createMessage', async () => TOOL_BEARING_RESPONSE as never);
+        await client.connect(clientTx);
+
+        const result = await client.callTool({ name: 'deploy', arguments: {} });
+        expect(result.content).toEqual([{ type: 'text', text: 'deployed' }]);
+
+        // The retry carries the bare tool-bearing response unchanged.
+        expect(toolCalls).toHaveLength(2);
+        const retryParams = toolCalls[1]!.params as { inputResponses?: Record<string, unknown> };
+        expect(retryParams.inputResponses?.weather).toEqual(TOOL_BEARING_RESPONSE);
+
+        await client.close();
+    });
+
+    it('counts the first wire leg against maxTotalTimeout (the budget bounds the whole flow)', async () => {
+        let now = 1_000_000;
+        const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+        try {
+            const { clientTx, toolCalls } = await scriptedModernServer((_request, call) => {
+                // The first leg alone "takes" longer than the whole-flow budget.
+                now += 10_000;
+                return call === 1 ? { resultType: 'input_required', inputRequests: { github_login: ELICIT_ENTRY } } : COMPLETE_RESULT;
+            });
+
+            const client = makeClient();
+            client.setRequestHandler('elicitation/create', async () => ({ action: 'accept', content: { name: 'octocat' } }));
+            await client.connect(clientTx);
+
+            await expect(
+                client.callTool({ name: 'deploy', arguments: {} }, { timeout: 60_000, maxTotalTimeout: 5_000 })
+            ).rejects.toMatchObject({ code: SdkErrorCode.RequestTimeout, data: { maxTotalTimeout: 5_000 } });
+            // The flow failed before any retry reached the wire.
+            expect(toolCalls).toHaveLength(1);
+
+            await client.close();
+        } finally {
+            nowSpy.mockRestore();
+        }
+    });
+
+    it('fails fast with a typed error when input_required carries neither inputRequests nor requestState', async () => {
+        const { clientTx, toolCalls } = await scriptedModernServer(() => ({ resultType: 'input_required' }));
+
+        const client = makeClient();
+        client.setRequestHandler('elicitation/create', async () => ({ action: 'accept', content: { name: 'octocat' } }));
+        await client.connect(clientTx);
+
+        await expect(client.callTool({ name: 'deploy', arguments: {} })).rejects.toMatchObject({
+            code: SdkErrorCode.InvalidResult,
+            data: { method: 'tools/call', violation: 'input-required-missing-both' }
+        });
+        // Fail fast: the original params are never resent until the cap runs out.
+        expect(toolCalls).toHaveLength(1);
 
         await client.close();
     });

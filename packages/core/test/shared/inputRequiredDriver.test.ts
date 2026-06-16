@@ -198,6 +198,41 @@ describe('driver loop', () => {
         }
     });
 
+    test('the total-timeout budget is measured from the flow start (the original request), not the driver start', async () => {
+        const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => 10_000);
+        try {
+            const retries: unknown[] = [];
+            const outcome = runInputRequiredDriver({
+                config: { autoFulfill: true, maxRounds: 10 },
+                method: 'tools/call',
+                originalParams: { name: 'x' },
+                firstPayload: { inputRequests: { confirm: ELICIT_ENTRY } },
+                requestOptions: { maxTotalTimeout: 5_000 },
+                // The original request went out at t=4s; the first wire leg
+                // alone already exhausted the 5 s whole-flow budget by t=10s.
+                flowStartedAt: 4_000,
+                hooks: {
+                    dispatchInputRequest: () => Promise.resolve({ action: 'accept' }),
+                    retry: params => {
+                        retries.push(params);
+                        return Promise.resolve({ content: [] });
+                    }
+                }
+            });
+            await expect(outcome).rejects.toSatisfy((error: unknown) => {
+                expect(error).toBeInstanceOf(SdkError);
+                const typed = error as SdkError;
+                expect(typed.code).toBe(SdkErrorCode.RequestTimeout);
+                expect(typed.data).toMatchObject({ maxTotalTimeout: 5_000, totalElapsed: 6_000 });
+                return true;
+            });
+            // Fail before any retry hits the wire: the budget was already gone.
+            expect(retries).toHaveLength(0);
+        } finally {
+            nowSpy.mockRestore();
+        }
+    });
+
     test('each round is surfaced as synthetic progress to the caller', async () => {
         const progress: number[] = [];
         await runInputRequiredDriver({

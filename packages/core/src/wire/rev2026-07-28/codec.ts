@@ -139,11 +139,28 @@ export const rev2026Codec: WireCodec = {
         }
         if (rawResultType === 'input_required') {
             // The driver seam (#13 consumes this payload).
-            const inputRequests = raw['inputRequests'];
+            const rawInputRequests = raw['inputRequests'];
+            const inputRequests = isPlainObject(rawInputRequests) ? rawInputRequests : {};
+            const requestState = raw['requestState'];
+            if (Object.keys(inputRequests).length === 0 && typeof requestState !== 'string') {
+                // At-least-one rule, client side: with neither inputRequests
+                // nor requestState there is nothing to fulfil and nothing to
+                // echo — retrying would only resend the original params until
+                // the round cap is exhausted, so fail fast instead.
+                return {
+                    kind: 'invalid',
+                    error: new SdkError(
+                        SdkErrorCode.InvalidResult,
+                        `Invalid result for ${method}: input_required carries neither inputRequests nor requestState ` +
+                            `(every input_required result must include at least one of the two)`,
+                        { method, violation: 'input-required-missing-both' }
+                    )
+                };
+            }
             return {
                 kind: 'input_required',
-                inputRequests: isPlainObject(inputRequests) ? inputRequests : {},
-                ...(typeof raw['requestState'] === 'string' && { requestState: raw['requestState'] })
+                inputRequests,
+                ...(typeof requestState === 'string' && { requestState })
             };
         }
         if (rawResultType !== 'complete') {

@@ -453,8 +453,8 @@ export class Client extends Protocol<ClientContext> {
                 // era (where sampling reaches the handler only as an embedded
                 // input request).
                 const codec = codecForVersion(this._negotiatedProtocolVersion);
-                const samplingRequestSchema =
-                    codec.requestSchema('sampling/createMessage') ?? codec.inputRequestSchema('sampling/createMessage');
+                const wireSamplingRequestSchema = codec.requestSchema('sampling/createMessage');
+                const samplingRequestSchema = wireSamplingRequestSchema ?? codec.inputRequestSchema('sampling/createMessage');
                 if (!samplingRequestSchema) {
                     throw new ProtocolError(
                         ProtocolErrorCode.InternalError,
@@ -472,13 +472,28 @@ export class Client extends Protocol<ClientContext> {
 
                 const result = await handler(request, ctx);
 
-                // The result schema depends on the REQUEST params (tools vs
-                // no tools) — something a method-keyed registry entry cannot
-                // express, so the pair is picked here. The era gate keeps
-                // this era-correct: sampling/createMessage is only ever
-                // dispatched on an era whose registry defines it.
+                // The result-side schema mirrors the request-side selection so
+                // both stay on the same era's vocabulary. On the 2025 era the
+                // schema depends on the REQUEST params (tools vs no tools) —
+                // something a method-keyed registry entry cannot express, so
+                // the pair is picked here. When the request schema came from
+                // the in-band fallback (2026 era, where sampling reaches the
+                // handler only as an embedded input request), the embedded
+                // response schema applies — it covers plain and tool-bearing
+                // responses alike.
                 const hasTools = params.tools || params.toolChoice;
-                const resultSchema = hasTools ? CreateMessageResultWithToolsSchema : CreateMessageResultSchema;
+                const resultSchema =
+                    wireSamplingRequestSchema === undefined
+                        ? codec.inputResponseSchema('sampling/createMessage')
+                        : hasTools
+                          ? CreateMessageResultWithToolsSchema
+                          : CreateMessageResultSchema;
+                if (!resultSchema) {
+                    throw new ProtocolError(
+                        ProtocolErrorCode.InternalError,
+                        'No result schema for sampling/createMessage in the resolved era'
+                    );
+                }
                 const validationResult = parseSchema(resultSchema, result);
                 if (!validationResult.success) {
                     const errorMessage =

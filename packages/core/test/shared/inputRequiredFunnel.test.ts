@@ -16,6 +16,7 @@ import { Protocol, setNegotiatedProtocolVersion } from '../../src/shared/protoco
 import type { JSONRPCRequest } from '../../src/types/index.js';
 import { isInputRequiredResult } from '../../src/types/guards.js';
 import { InMemoryTransport } from '../../src/util/inMemory.js';
+import { rev2026Codec } from '../../src/wire/rev2026-07-28/codec.js';
 
 class TestProtocol extends Protocol<BaseContext> {
     protected assertCapabilityForMethod(): void {}
@@ -91,6 +92,29 @@ describe('manual mode (allowInputRequired)', () => {
             data: { resultType: 'input_required', method: 'tools/call' }
         });
         await protocol.close();
+    });
+
+    test('an input_required carrying neither inputRequests nor requestState fails fast as an invalid result, even with the opt-in', async () => {
+        const protocol = await wireWithRawResult({ resultType: 'input_required' });
+        await expect(
+            protocol.request({ method: 'tools/call', params: { name: 'echo', arguments: {} } }, { allowInputRequired: true })
+        ).rejects.toMatchObject({
+            code: 'INVALID_RESULT',
+            data: { method: 'tools/call', violation: 'input-required-missing-both' }
+        });
+        await protocol.close();
+    });
+});
+
+describe('era gate (in-band vocabulary grants no registry membership)', () => {
+    test('the demoted methods are absent from the 2026-07-28 wire-request registry even though their in-band schemas exist', () => {
+        for (const method of ['elicitation/create', 'sampling/createMessage', 'roots/list']) {
+            expect(rev2026Codec.inputRequestSchema(method), method).toBeDefined();
+            // A peer sending one of these as a wire request on the 2026 era
+            // still answers −32601 by absence — the in-band fallback used for
+            // embedded dispatch must never grant wire-request membership.
+            expect(rev2026Codec.hasRequestMethod(method), method).toBe(false);
+        }
     });
 });
 

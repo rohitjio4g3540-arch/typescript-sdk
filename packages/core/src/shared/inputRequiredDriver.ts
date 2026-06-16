@@ -146,6 +146,11 @@ function sleep(ms: number): Promise<void> {
  * Runs the auto-fulfilment loop for one originating request. Resolves with
  * the final complete result (already validated by the retry leg) or rejects
  * with a typed error.
+ *
+ * `flowStartedAt` is the timestamp the ORIGINAL request was issued at (not
+ * when the driver started): `maxTotalTimeout` bounds the whole flow, so the
+ * first wire leg counts against the budget too. When omitted, accounting
+ * starts when the driver starts.
  */
 export async function runInputRequiredDriver(args: {
     config: ResolvedInputRequiredDriverConfig;
@@ -154,9 +159,10 @@ export async function runInputRequiredDriver(args: {
     firstPayload: InputRequiredPayload;
     requestOptions: InputRequiredDriverRequestOptions;
     hooks: InputRequiredDriverHooks;
+    flowStartedAt?: number;
 }): Promise<unknown> {
     const { config, method, originalParams, requestOptions, hooks } = args;
-    const startedAt = Date.now();
+    const startedAt = args.flowStartedAt ?? Date.now();
     let payload = args.firstPayload;
     let round = 0;
 
