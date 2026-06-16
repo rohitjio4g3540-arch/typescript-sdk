@@ -503,13 +503,12 @@ export interface InputResponses {
  * surfaces it raw at `ctx.mcpReq.requestState` and applies no integrity
  * protection of its own.
  */
-export interface InputRequiredResult {
+export interface InputRequiredResult extends Result {
     resultType: 'input_required';
     /** Embedded requests the client must fulfil before retrying. */
     inputRequests?: InputRequests;
     /** Opaque server state the client echoes back verbatim on retry. */
     requestState?: string;
-    _meta?: { [key: string]: unknown };
 }
 
 /* Client messages */

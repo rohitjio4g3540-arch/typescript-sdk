@@ -1126,10 +1126,49 @@ Resolution is per field, most specific author first: for each of `ttlMs` and `ca
 per-resource hint that sets only one field never suppresses the other field configured at the operation level. Configured hints are validated when they are configured — an invalid `ttlMs` (negative or non-integer) or `cacheScope` throws a `RangeError`. Responses on
 2025-era connections never carry these fields, with or without configuration.
 
+### Multi round-trip requests (2026-07-28): write-once handlers and the client auto-fulfilment driver
+
+The 2026-07-28 revision removes the server→client JSON-RPC request channel: servers obtain client input (elicitation, sampling, roots) **in-band**, by answering `tools/call`, `prompts/get`, or `resources/read` with an `input_required` result that embeds the requests, and
+the client retries the original call with the responses. The SDK ships both halves:
+
+**Server side — return `inputRequired(...)` instead of pushing requests.** A handler for one of the three multi-round-trip methods requests input by returning the value built by `inputRequired()` (with the per-kind constructors `inputRequired.elicit`,
+`inputRequired.elicitUrl`, `inputRequired.createMessage`, `inputRequired.listRoots`), and reads the responses on re-entry from `ctx.mcpReq.inputResponses` (the `acceptedContent()` helper reads an accepted form elicitation). Hand-built `resultType: 'input_required'` literals
+are equally legal. The same handler keeps working for 2025-era clients today by serving them the old way (the in-band return is only legal toward 2026-07-28 requests; the automatic legacy bridge that replays the embedded requests as real server→client requests on 2025
+sessions is a separate, upcoming feature — until it lands, an `input_required` return on a 2025-era request fails as a server-side internal error rather than reaching the wire mis-typed).
+
+```typescript
+server.registerTool('deploy', { inputSchema: z.object({ env: z.string() }) }, async ({ env }, ctx) => {
+    const confirmed = acceptedContent<{ confirm: boolean }>(ctx.mcpReq.inputResponses, 'confirm');
+    if (!confirmed?.confirm) {
+        return inputRequired({
+            inputRequests: { confirm: inputRequired.elicit({ message: `Deploy to ${env}?`, requestedSchema: confirmSchema }) }
+        });
+    }
+    return { content: [{ type: 'text', text: `deployed to ${env}` }] };
+});
+```
+
+On 2026-era requests the push-style APIs (`ctx.mcpReq.send` of server→client requests, `ctx.mcpReq.elicitInput`, `ctx.mcpReq.requestSampling`, and the instance-level `server.createMessage()`/`elicitInput()`/`listRoots()`/`ping()` on modern-bound instances) fail with a
+typed local error before anything reaches the wire; in a tool handler the error surfaces to the caller as an `isError` result whose text steers to returning `inputRequired(...)`. Their behavior toward 2025-era requests is unchanged. The `-32042` URL-elicitation error also
+never appears on the 2026-07-28 wire: a `UrlElicitationRequiredError` thrown while serving a 2026-era request is converted into a URL-mode elicitation embedded in an `input_required` result (when the request declared the `elicitation.url` capability), while 2025-era serving
+keeps today's `-32042` behavior exactly.
+
+**`requestState` is untrusted input — protect it yourself.** `inputRequired({ requestState })` lets a server round-trip opaque state through the client instead of holding it in memory. The SDK treats it as an opaque string end to end: the client echoes it back byte-exact
+and never parses it, and the server sees the echoed value raw at `ctx.mcpReq.requestState`. The specification's requirement is the consumer's obligation: the value comes back as **attacker-controlled input**, so if it influences authorization, resource access, or business
+logic you MUST integrity-protect it when minting it (for example HMAC or AEAD over the payload, bound to the principal, the originating method/parameters, and an expiry) and MUST reject state that fails verification on re-entry. The SDK does not provide or apply any sealing
+of its own.
+
+**Client side — auto-fulfilment by default.** When a call to `tools/call`, `prompts/get`, or `resources/read` on a 2026-07-28 connection answers `input_required`, the client fulfils the embedded requests through the same handlers registered with
+`setRequestHandler('elicitation/create' | 'sampling/createMessage' | 'roots/list', …)` and retries the original request (fresh request id, `inputResponses`, byte-exact `requestState` echo) up to `inputRequired.maxRounds` rounds (default 10). `client.callTool()` and its
+siblings keep returning their plain result types — the interactive rounds happen inside the call, and a registered handler written for the 2025 flow keeps working unchanged. Configure or opt out via `ClientOptions.inputRequired` (`{ autoFulfill: false }`), drive the flow
+manually per call with the `allowInputRequired: true` request option plus the `withInputRequired()` schema wrapper, and expect the typed `InputRequiredRoundsExceeded` error when the round cap is exhausted. 2025-era connections are unaffected (the legacy wire has no
+`input_required` vocabulary).
+
 ### Typed `-32003` missing-client-capability error
 
 `MissingRequiredClientCapabilityError` is the typed error class for the 2026-07-28 `-32003` protocol error: processing a request requires a capability the client did not declare in the request's `clientCapabilities`. Its `data.requiredCapabilities` lists the missing
-capabilities, and `ProtocolError.fromError` recognizes the code/data shape (recognize peers' errors by their code and `error.data`, not by `instanceof`). When the HTTP entry refuses such a request, the response uses HTTP status `400` as the specification requires.
+capabilities, and `ProtocolError.fromError` recognizes the code/data shape (recognize peers' errors by their code and `error.data`, not by `instanceof`). When the HTTP entry refuses such a request, the response uses HTTP status `400` as the specification requires. The
+multi-round-trip seam answers with the same error when a handler embeds an input request (for example an elicitation) that the request's declared client capabilities do not cover.
 
 ### Client identity accessors deprecated in favor of per-request context
 

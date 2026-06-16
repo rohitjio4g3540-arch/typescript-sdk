@@ -54,6 +54,45 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * The client capabilities an embedded multi-round-trip input request requires
+ * (call site 2 — the outbound input-request leg): a server MUST NOT send an
+ * `inputRequests` kind the request's declared client capabilities do not
+ * cover. Returns `undefined` for entries whose method is not one of the
+ * embedded input-request kinds (those are a server bug handled separately,
+ * not a capability question).
+ *
+ * The requirement is mode-aware where the capability is: URL-mode elicitation
+ * requires `elicitation.url`; form-mode (or mode-omitted) elicitation requires
+ * `elicitation`; sampling with `tools`/`toolChoice` requires `sampling.tools`.
+ */
+export function requiredClientCapabilitiesForInputRequest(entry: {
+    method: string;
+    params?: Record<string, unknown>;
+}): ClientCapabilities | undefined {
+    switch (entry.method) {
+        case 'elicitation/create': {
+            if (entry.params?.['mode'] === 'url') {
+                return { elicitation: { url: {} } };
+            }
+            return { elicitation: {} };
+        }
+        case 'sampling/createMessage': {
+            const params = entry.params;
+            if (params !== undefined && (params['tools'] !== undefined || params['toolChoice'] !== undefined)) {
+                return { sampling: { tools: {} } };
+            }
+            return { sampling: {} };
+        }
+        case 'roots/list': {
+            return { roots: {} };
+        }
+        default: {
+            return undefined;
+        }
+    }
+}
+
+/**
  * Computes the subset of `required` client capabilities the client did not
  * declare. Returns `undefined` when every required capability is declared;
  * otherwise returns an object in the `ClientCapabilities` shape containing
