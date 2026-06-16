@@ -1137,6 +1137,8 @@ are equally legal. The same handler keeps working for 2025-era clients today by 
 sessions is a separate, upcoming feature — until it lands, an `input_required` return on a 2025-era request fails as a server-side internal error rather than reaching the wire mis-typed).
 
 ```typescript
+const confirmSchema = { type: 'object', properties: { confirm: { type: 'boolean' } }, required: ['confirm'] } as const;
+
 server.registerTool('deploy', { inputSchema: z.object({ env: z.string() }) }, async ({ env }, ctx) => {
     const confirmed = acceptedContent<{ confirm: boolean }>(ctx.mcpReq.inputResponses, 'confirm');
     if (!confirmed?.confirm) {
