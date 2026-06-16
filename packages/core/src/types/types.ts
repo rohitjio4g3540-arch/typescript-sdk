@@ -482,10 +482,10 @@ export interface InputResponses {
 /**
  * The input-required result a handler for a multi-round-trip method
  * (`tools/call`, `prompts/get`, `resources/read`) returns to request more
- * input from the client (protocol revision 2026-07-28). Build it with
- * {@linkcode shared/inputRequired.inputRequired | inputRequired()}; hand-built
- * literals are equally legal — `resultType: 'input_required'` is the
- * discriminator, and the SDK re-checks the at-least-one rule at the seam.
+ * input from the client (protocol revision 2026-07-28). Build it with the
+ * `inputRequired()` builder; hand-built literals are equally legal —
+ * `resultType: 'input_required'` is the discriminator, and the SDK re-checks
+ * the at-least-one rule at the seam.
  *
  * This is the one place the wire discriminator `resultType` appears on the
  * neutral surface: the handler authors it, the 2026-07-28 codec passes it

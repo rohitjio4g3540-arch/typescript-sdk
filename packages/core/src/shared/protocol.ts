@@ -236,14 +236,6 @@ function liftWireOnlyMaterial<T extends JSONRPCRequest | JSONRPCNotification>(
 }
 
 /**
- * Splits a retried request's `inputResponses` map into the BARE response
- * entries the spec defines and everything else. The spec's embedded responses
- * are the bare result objects (an `ElicitResult`, `CreateMessageResult`, or
- * `ListRootsResult`); a wrapped `{method, result}` envelope (a shape some
- * peers emit) is never accepted as a response — its key is recorded so the
- * handler can re-issue the corresponding input request.
- */
-/**
  * Related send/notify are unavailable inside an embedded input-request
  * handler: the request is fulfilled locally by the multi-round-trip driver,
  * so there is no live peer request to relate messages to.
@@ -256,6 +248,14 @@ function relatedMessagingUnavailable(member: string): never {
     );
 }
 
+/**
+ * Splits a retried request's `inputResponses` map into the BARE response
+ * entries the spec defines and everything else. The spec's embedded responses
+ * are the bare result objects (an `ElicitResult`, `CreateMessageResult`, or
+ * `ListRootsResult`); a wrapped `{method, result}` envelope (a shape some
+ * peers emit) is never accepted as a response — its key is recorded so the
+ * handler can re-issue the corresponding input request.
+ */
 function partitionInputResponses(inputResponses: unknown): { accepted: Record<string, unknown>; droppedKeys: string[] } {
     const accepted: Record<string, unknown> = {};
     const droppedKeys: string[] = [];
@@ -321,8 +321,7 @@ export type BaseContext = {
          * handler sees. Entries are the BARE response objects keyed by the
          * identifiers the server assigned in `inputRequests`; entries that do
          * not look like bare responses (e.g. a `{method, result}` wrapper)
-         * are dropped and their keys recorded in
-         * {@linkcode BaseContext.mcpReq.droppedInputResponseKeys | droppedInputResponseKeys}.
+         * are dropped and their keys recorded in `droppedInputResponseKeys`.
          *
          * The values arrive from the client and are NOT validated by the SDK
          * — treat them as untrusted input.
